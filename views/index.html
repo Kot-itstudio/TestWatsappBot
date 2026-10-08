@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WhatsApp Bot Panel</title>
+<style>
+  body { font-family: sans-serif; background: #111b21; color: #e9edef; margin: 0; padding: 24px; }
+  h1 { font-size: 20px; }
+  .card { background: #202c33; border-radius: 8px; padding: 16px; max-width: 420px; margin-bottom: 16px; }
+  #qr img, #qr svg { width: 260px; height: 260px; background: #fff; border-radius: 8px; padding: 8px; }
+  .state { text-transform: uppercase; letter-spacing: 1px; font-size: 13px; color: #53bdeb; }
+  .muted { color: #8696a0; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Панель WhatsApp-бота</h1>
+<div class="card">
+  <div class="state" id="state">init</div>
+  <div class="muted" id="voip"></div>
+</div>
+<div class="card" id="qr"></div>
+<script>
+async function refresh() {
+  try {
+    const res = await fetch("/status");
+    const data = await res.json();
+    document.getElementById("state").textContent = data.state;
+    document.getElementById("voip").textContent = data.voip.available ? "VoIP: готово" : "VoIP: недоступна";
+    const qrBox = document.getElementById("qr");
+    if (data.qr) {
+      qrBox.innerHTML = '<img src="/qr.svg" alt="QR">';
+    } else {
+      qrBox.innerHTML = '<span class="muted">QR нет (сессия активна или ожидание)</span>';
+    }
+  } catch (e) {
+    document.getElementById("state").textContent = "offline";
+  }
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

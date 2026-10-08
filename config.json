@@ -1,0 +1,14 @@
+{
+  "owner": "7999000112234@s.whatsapp.net",
+  "prefix": "!",
+  "easter_egg_file": "secret_message.mp3",
+  "web_port": 3000,
+  "voip": {
+    "wavoip_token": "",
+    "software_name": "WabaVoiceBot",
+    "auto_reject_incoming": true,
+    "sample_rate": 48000,
+    "channels": 1,
+    "bitrate_kbps": 32
+  }
+}
