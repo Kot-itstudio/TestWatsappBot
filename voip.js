@@ -63,81 +63,107 @@ export function listAudioFiles() {
 export class VoipSession {
   constructor(voipConfig) {
     this.config = voipConfig;
+    this.coreSock = null;
     this.client = null;
-    this.rc13Sock = null;
     this.caller = null;
+    this.peerJid = null;
     this.player = null;
+    this.currentFile = null;
     this.loop = false;
     this.muted = false;
-    this.active = false;
+    this.streamAttached = false;
   }
 
-  async connect(coreSock) {
+  async connect() {
     if (!wavoip) {
       throw new Error(wavoipError || "voice-calls-baileys недоступна");
     }
-    let sessionSock = coreSock;
-    try {
-      const baileysRc13 = await import("baileys");
-      const authDir = path.resolve("data", "auth-rc13");
-      if (!fs.existsSync(authDir)) {
-        fs.mkdirSync(authDir, { recursive: true });
-      }
-      const rc13Auth = await baileysRc13.useMultiFileAuthState(authDir);
-      this.rc13Sock = baileysRc13.makeWASocket({
-        auth: rc13Auth.state,
-        printQRInTerminal: false,
-      });
-      this.rc13Sock.ev.on("connection.update", (u) => {
-        if (u.connection === "open") {
-          console.log("[voip] rc13-сессия открыта");
-        }
-      });
-      sessionSock = this.rc13Sock;
-    } catch (e) {
-      console.warn("[voip] не удалось поднять отдельную rc13-сессию, использую ядро:", e.message);
+    if (this.client) {
+      return this.client;
     }
-    this.client = new wavoip(sessionSock, {
+    this.client = new wavoip(this.coreSock, {
       token: this.config.wavoip_token,
       software_name: this.config.software_name,
+      sample_rate: this.config.sample_rate || 48000,
+      channels: this.config.channels || 1,
     });
     await this.client.connect();
-    this.active = true;
+    this.bindCallEvents();
     return this.client;
   }
 
-  async dial(jid) {
-    if (!this.client) {
-      throw new Error("VoIP-сессия не подключена");
+  bindCallEvents() {
+    if (!this.client || typeof this.client.on !== "function") {
+      return;
     }
-    const link = await this.client.createCallLink(jid);
-    this.caller = await this.client.callFromLink(link, jid);
-    return link;
+    this.client.on("call:update", (call) => {
+      const state = call?.state || call?.status;
+      if (state === "connect" || state === "active") {
+        this.attachPlayerStream();
+      }
+      if (state === "end" || state === "ended" || state === "hangup") {
+        this.caller = null;
+        this.peerJid = null;
+        this.streamAttached = false;
+        this.stopPlayer();
+      }
+    });
+  }
+
+  async dial(jid) {
+    if (this.client) {
+      this.peerJid = jid;
+    } else {
+      await this.connect();
+      this.peerJid = jid;
+    }
+    let link = null;
+    let caller = null;
+    if (typeof this.client.createCallLink === "function") {
+      link = await this.client.createCallLink(jid);
+    }
+    if (typeof this.client.call === "function") {
+      caller = link
+        ? await this.client.call(link, jid)
+        : await this.client.call(jid);
+    } else if (typeof this.client.callFromLink === "function" && link) {
+      caller = await this.client.callFromLink(link, jid);
+    } else {
+      throw new Error("у Wavoip нет метода дозвона (call/callFromLink)");
+    }
+    this.caller = caller;
+    this.attachPlayerStream();
+    return link || jid;
   }
 
   attachPlayerStream() {
-    if (!this.player || !this.caller) {
+    if (!this.player || !this.client) {
       return false;
     }
-    try {
-      if (typeof this.caller.addMediaStream === "function") {
-        this.caller.addMediaStream(this.player.stdout);
-        return true;
+    const stream = this.player.stdout;
+    const targets = [this.caller, this.client];
+    const methods = ["addMediaStream", "setMicrophoneStream", "injectStream"];
+    for (const target of targets) {
+      if (!target) continue;
+      for (const method of methods) {
+        if (typeof target[method] === "function") {
+          try {
+            target[method](stream);
+            this.streamAttached = true;
+            return true;
+          } catch (e) {
+            console.warn(`[voip] ${method} не сработал:`, e.message);
+          }
+        }
       }
-      if (typeof this.client?.addMediaStream === "function") {
-        this.client.addMediaStream(this.player.stdout);
-        return true;
-      }
-      console.warn("[voip] у Wavoip нет метода addMediaStream, PCM в медиа-мост не передан");
-      return false;
-    } catch (e) {
-      console.warn("[voip] не удалось подключить плеер к медиа-мосту:", e.message);
-      return false;
     }
+    console.warn("[voip] не найден метод подачи PCM в медиа-мост, звук в звонок не пошёл");
+    return false;
   }
 
   startPlayer(file) {
     this.stopPlayer();
+    this.currentFile = file;
     const args = [
       "-i", file,
       "-f", "s16le",
@@ -155,14 +181,31 @@ export class VoipSession {
     }
     this.player.on("error", (e) => {
       console.warn("[voip] ошибка процесса ffmpeg:", e.message);
+      this.loop = false;
       this.player = null;
     });
-    this.player.on("close", () => {
-      this.player = null;
-      if (this.loop) {
-        this.startPlayer(file);
+    this.player.stdout.on("error", (e) => {
+      console.warn("[voip] ошибка чтения PCM-потока:", e.message);
+    });
+    this.player.stderr.on("data", (chunk) => {
+      const msg = chunk.toString().trim();
+      if (msg) {
+        console.warn(`[voip] ffmpeg: ${msg}`);
       }
     });
+    this.player.on("close", (code) => {
+      this.player = null;
+      this.streamAttached = false;
+      if (code !== 0) {
+        console.warn(`[voip] ffmpeg завершился с кодом ${code}, повтор отключён`);
+        this.loop = false;
+        return;
+      }
+      if (this.loop && this.currentFile) {
+        this.startPlayer(this.currentFile);
+      }
+    });
+    this.attachPlayerStream();
     return this.player;
   }
 
@@ -174,6 +217,7 @@ export class VoipSession {
         console.warn("[voip] не удалось остановить плеер:", e.message);
       }
       this.player = null;
+      this.streamAttached = false;
     }
   }
 
@@ -182,12 +226,15 @@ export class VoipSession {
     try {
       if (this.caller && typeof this.caller.hangup === "function") {
         this.caller.hangup();
+      } else if (typeof this.client?.hangup === "function") {
+        this.client.hangup();
       }
     } catch (e) {
       console.warn("[voip] ошибка при завершении звонка:", e.message);
     }
     this.caller = null;
-    this.active = false;
+    this.peerJid = null;
+    this.streamAttached = false;
   }
 
   status() {
@@ -195,7 +242,9 @@ export class VoipSession {
       available: Boolean(wavoip),
       connected: Boolean(this.client),
       in_call: Boolean(this.caller),
+      peer: this.peerJid,
       playing: Boolean(this.player),
+      stream_attached: this.streamAttached,
       loop: this.loop,
       muted: this.muted,
     };

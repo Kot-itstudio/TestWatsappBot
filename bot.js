@@ -151,7 +151,7 @@ function helpText() {
     `${p}луп / ${p}loop — повтор трека`,
     `${p}майд / ${p}mute — мут микрофона`,
     `${p}микр / ${p}unmute — снять мут`,
-    `${p}звони <номер> / ${p}call — позвонить`,
+    `${p}звони <номер> [файл.mp3] / ${p}call — позвонить и играть аудио`,
     `${p}выйти / ${p}hangup — завершить звонок`,
     `${p}файлы / ${p}files — список аудио`,
     `${p}статус / ${p}status — состояние`,
@@ -179,7 +179,7 @@ function runMenuItem(chatId, item) {
       handleMute(chatId, false);
       break;
     case "Звони":
-      sendText(chatId, `Используйте ${p}звони <номер>`);
+      sendText(chatId, `Используйте ${p}звони <номер> [файл.mp3]`);
       break;
     case "Выйти":
       handleHangup(chatId);
@@ -365,14 +365,17 @@ function handlePlay(chatId, parts) {
     sendText(chatId, "Не удалось запустить плеер (проверьте ffmpeg)");
     return;
   }
-  sendText(chatId, `Играет: ${resolved.name}`);
-  if (config.easter_egg_file && resolved.name === config.easter_egg_file) {
-    sendText(chatId, "🥚 СЕКРЕТНАЯ ПАСХАЛКА!");
+  if (voip.status().in_call && voip.status().stream_attached) {
+    sendText(chatId, `Играю в звонок: ${resolved.name}`);
+  } else if (voip.status().in_call) {
+    sendText(chatId, `Играю: ${resolved.name}. В медиа-мост не подключено, дублирую голосовым`);
+    sendPtt(chatId, resolved.file);
+  } else {
+    sendText(chatId, `Играю: ${resolved.name}`);
     sendPtt(chatId, resolved.file);
   }
-  if (voip.status().in_call) {
-    voip.attachPlayerStream();
-  } else {
+  if (config.easter_egg_file && resolved.name === config.easter_egg_file) {
+    sendText(chatId, "🥚 СЕКРЕТНАЯ ПАСХАЛКА!");
     sendPtt(chatId, resolved.file);
   }
 }
@@ -412,7 +415,9 @@ function handleStatus(chatId) {
       `VoIP доступно: ${info.available ? "да" : "нет"}`,
       info.error ? `VoIP ошибка: ${info.error}` : "",
       `В звонке: ${st.in_call ? "да" : "нет"}`,
+      st.peer ? `Собеседник: ${st.peer}` : "",
       `Играет: ${st.playing ? "да" : "нет"}`,
+      st.playing ? `Звук в медиа-мосте: ${st.stream_attached ? "да" : "нет"}` : "",
       `Луп: ${st.loop ? "да" : "нет"}`,
       `Мут: ${st.muted ? "да" : "нет"}`,
     ]
@@ -424,7 +429,7 @@ function handleStatus(chatId) {
 async function handleCall(chatId, parts) {
   const phone = normalizePhone(parts[0]);
   if (!phone) {
-    sendText(chatId, "Укажите номер телефона");
+    sendText(chatId, `Используйте ${config.prefix}звони <номер> [файл.mp3]`);
     return;
   }
   if (!voipInfo().available) {
@@ -433,11 +438,25 @@ async function handleCall(chatId, parts) {
   }
   const jid = `${phone}@s.whatsapp.net`;
   try {
-    if (!voip.status().connected) {
-      await voip.connect(sock);
-    }
+    sendText(chatId, `Звоним на +${phone}...`);
+    voip.coreSock = sock;
+    await voip.connect();
     const link = await voip.dial(jid);
-    sendText(chatId, `Звоним: https://wa.me/call/${link}`);
+    sendText(chatId, `Звонок инициирован: ${link}`);
+    const name = parts[1];
+    if (name) {
+      const resolved = resolveAudioFile(name);
+      if (!resolved.ok) {
+        sendText(chatId, `Не играю: ${resolved.reason}`);
+        return;
+      }
+      voip.startPlayer(resolved.file);
+      if (voip.status().playing) {
+        sendText(chatId, `Играю в звонок: ${resolved.name}`);
+      } else {
+        sendText(chatId, "Не удалось запустить плеер (проверьте ffmpeg)");
+      }
+    }
   } catch (e) {
     console.warn("[call] ошибка звонка:", e.message);
     sendText(chatId, `Не удалось позвонить: ${e.message}`);
