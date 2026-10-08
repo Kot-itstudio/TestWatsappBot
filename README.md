@@ -1,6 +1,6 @@
 # WhatsApp Voice Bot (Node.js, ESM)
 
-Бот на @vansnowi/baileys с VoIP через voice-calls-baileys (Wavoip), подменой микрофона и меню в стиле Godot. Без БД — только JSON-файлы.
+Бот на @vansnowi/baileys со звонками через нативную сигнализацию Baileys (бесплатно, без Wavoip-токена), подменой микрофона и меню в стиле Godot. Без БД — только JSON-файлы.
 
 ## Требования
 
@@ -21,12 +21,10 @@ npm install && npm start
 - `prefix` — префикс команд (по умолчанию `!`)
 - `easter_egg_file` — файл-пасхалка в папке `audio/`
 - `web_port` — порт веб-панели
-- `voip.wavoip_token` — токен Wavoip
-- `voip.software_name` — имя софта для медиа-моста devices.wavoip.com
 - `voip.auto_reject_incoming` — автоотклонение входящих звонков
 - `voip.sample_rate`, `voip.channels`, `voip.bitrate_kbps` — параметры звука
 
-VoIP-библиотека требует peer-зависимость `baileys@7.0.0-rc13` — вторая rc13-сессия поднимается отдельно от ядра (`@vansnowi/baileys`). Если `voice-calls-baileys` или ffmpeg недоступны, бот логирует warn и продолжает работать без звонков.
+Звонки работают бесплатно через прямую сигнализацию Baileys (call-offfer / props / terminate) — сторонние сервисы и токены не нужны. Для исходящих вызовов поднимается вторая сессия (`data/auth-call`, сканируется отдельным QR или pairing-кодом), так как веб-сессии WhatsApp не поддерживают исходящие звонки. Если ffmpeg недоступен, бот логирует warn и продолжает работать без звонков.
 
 ## Запуск
 
@@ -68,8 +66,9 @@ QR появляется в терминале и на веб-панели http:/
 ## Структура
 
 ```
-bot.js            — ядро: Baileys, команды, веб-панель
-voip.js           — Wavoip-сессия, ffmpeg-плеер, резолв аудио
+bot.js            — ядро: Baileys, команды, веб-панель, вторая сессия звонков
+calls.js          — CallManager: сигнализация звонков, ffmpeg-плеер Opus OGG
+voip.js           — резолв и whitelist аудио из папки audio/
 menu.js           — MenuState (up/down/pick с закручиванием)
 menu.gd           — эталон меню на Godot
 config.json       — настройки
@@ -81,5 +80,5 @@ data/             — auth-сессии и chats.json (создаётся авт
 ## Безопасность
 
 - Резолв аудио: `path.basename()` + whitelist расширений (`.mp3 .ogg .wav .m4a`), защита от path traversal
-- Импорт `voice-calls-baileys` и спавн ffmpeg обёрнуты в try/catch с понятными warn'ами — бот не падает
+- Спавн ffmpeg обёрнут в try/catch с понятными warn'ами — бот не падает
 - Битый JSON (config/chats) не роняет процесс
