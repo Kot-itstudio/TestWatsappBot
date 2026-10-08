@@ -1,20 +1,22 @@
 import fs from "fs";
 import path from "path";
 import { makeWASocket, useMultiFileAuthState, DisconnectReason } from "@vansnowi/baileys";
+import { makeWASocket as makeCallSocket, useMultiFileAuthState as useCallAuth, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from "@whiskeysockets/baileys";
 import express from "express";
 import QRCode from "qrcode";
+import qrcodeTerminal from "qrcode-terminal";
+import pino from "pino";
 import { MenuState } from "./menu.js";
-import {
-  VoipSession,
-  listAudioFiles,
-  resolveAudioFile,
-  voipInfo,
-} from "./voip.js";
+import { CallManager } from "./calls.js";
+import { listAudioFiles, resolveAudioFile } from "./voip.js";
 
 const DATA_DIR = path.resolve("data");
 const AUTH_DIR = path.join(DATA_DIR, "auth");
+const CALL_AUTH_DIR = path.join(DATA_DIR, "auth-call");
 const CHATS_FILE = path.join(DATA_DIR, "chats.json");
 const CONFIG_FILE = path.resolve("config.json");
+
+const logger = pino({ level: "fatal" });
 
 let config = loadConfig();
 
@@ -24,7 +26,8 @@ let currentQr = "";
 let connectionState = "init";
 let reconnectTimer = null;
 let sock = null;
-let voip = new VoipSession(config.voip || {});
+let callSock = null;
+let calls = null;
 
 const mainItems = [
   "Плей",
@@ -146,12 +149,12 @@ function helpText() {
     `${p}меню вниз | ${p}menu down — навигация`,
     `${p}меню <номер> | ${p}menu <n> — выбрать пункт`,
     `${p}выбор / ${p}accept — выполнить выбранный пункт`,
-    `${p}плей <файл> / ${p}play — играть аудио`,
+    `${p}плей <файл> / ${p}play — играть аудио (в звонке идёт собеседнику)`,
     `${p}стоп / ${p}stop — остановить плеер`,
     `${p}луп / ${p}loop — повтор трека`,
     `${p}майд / ${p}mute — мут микрофона`,
     `${p}микр / ${p}unmute — снять мут`,
-    `${p}звони <номер> [файл.mp3] / ${p}call — позвонить и играть аудио`,
+    `${p}звони <номер> [файл] / ${p}call — позвонить и играть аудио`,
     `${p}выйти / ${p}hangup — завершить звонок`,
     `${p}файлы / ${p}files — список аудио`,
     `${p}статус / ${p}status — состояние`,
@@ -179,7 +182,7 @@ function runMenuItem(chatId, item) {
       handleMute(chatId, false);
       break;
     case "Звони":
-      sendText(chatId, `Используйте ${p}звони <номер> [файл.mp3]`);
+      sendText(chatId, `Используйте ${p}звони <номер> [файл]`);
       break;
     case "Выйти":
       handleHangup(chatId);
@@ -203,9 +206,11 @@ function runDevItem(chatId, item, args) {
     case "Очистить_состояние":
       menus.delete(chatId);
       devMenus.delete(chatId);
-      voip.stopPlayer();
-      voip.loop = false;
-      voip.muted = false;
+      if (calls) {
+        calls.stopPlayer();
+        calls.loop = false;
+        calls.setMuted(false);
+      }
       sendText(chatId, "Состояние очищено");
       break;
     case "Широковещ": {
@@ -228,7 +233,6 @@ function runDevItem(chatId, item, args) {
       break;
     case "Конфиг": {
       const safe = { ...config };
-      if (safe.voip) safe.voip = { ...safe.voip, wavoip_token: "***" };
       sendText(chatId, JSON.stringify(safe, null, 2));
       break;
     }
@@ -236,7 +240,7 @@ function runDevItem(chatId, item, args) {
       handlePlay(chatId, ["test.mp3"]);
       break;
     case "Звонки":
-      sendText(chatId, `Активный звонок: ${voip.status().in_call ? "да" : "нет"}`);
+      sendText(chatId, `Состояние звонка: ${calls ? calls.status().state : "нет"}`);
       break;
     case "Справочник":
       sendText(chatId, helpText());
@@ -346,6 +350,10 @@ function handleDev(chatId, parts) {
 }
 
 function handlePlay(chatId, parts) {
+  if (!calls) {
+    sendText(chatId, "Сервис звонков не готов");
+    return;
+  }
   const files = listAudioFiles();
   let name = parts[0];
   if (!name) {
@@ -360,18 +368,16 @@ function handlePlay(chatId, parts) {
     sendText(chatId, `Ошибка: ${resolved.reason}`);
     return;
   }
-  voip.startPlayer(resolved.file);
-  if (!voip.status().playing) {
+  const inCall = calls.state === "active" || calls.state === "ringing" || calls.state === "dialing";
+  const started = calls.play(resolved.file);
+  if (!started) {
     sendText(chatId, "Не удалось запустить плеер (проверьте ffmpeg)");
     return;
   }
-  if (voip.status().in_call && voip.status().stream_attached) {
-    sendText(chatId, `Играю в звонок: ${resolved.name}`);
-  } else if (voip.status().in_call) {
-    sendText(chatId, `Играю: ${resolved.name}. В медиа-мост не подключено, дублирую голосовым`);
-    sendPtt(chatId, resolved.file);
+  if (inCall) {
+    sendText(chatId, `Играет в звонок: ${resolved.name}`);
   } else {
-    sendText(chatId, `Играю: ${resolved.name}`);
+    sendText(chatId, `Играет: ${resolved.name}`);
     sendPtt(chatId, resolved.file);
   }
   if (config.easter_egg_file && resolved.name === config.easter_egg_file) {
@@ -381,18 +387,26 @@ function handlePlay(chatId, parts) {
 }
 
 function handleStop(chatId) {
-  voip.stopPlayer();
-  voip.loop = false;
+  if (calls) {
+    calls.stopPlayer();
+    calls.loop = false;
+  }
   sendText(chatId, "Плеер остановлен");
 }
 
 function handleLoop(chatId) {
-  voip.loop = !voip.loop;
-  sendText(chatId, `Повтор трека: ${voip.loop ? "включён" : "выключен"}`);
+  if (!calls) {
+    sendText(chatId, "Сервис звонков не готов");
+    return;
+  }
+  calls.loop = !calls.loop;
+  sendText(chatId, `Повтор трека: ${calls.loop ? "включён" : "выключен"}`);
 }
 
 function handleMute(chatId, value) {
-  voip.muted = value;
+  if (calls) {
+    calls.setMuted(value);
+  }
   sendText(chatId, value ? "Микрофон заглушён" : "Микрофон включён");
 }
 
@@ -406,18 +420,14 @@ function handleFiles(chatId) {
 }
 
 function handleStatus(chatId) {
-  const info = voipInfo();
-  const st = voip.status();
+  const st = calls ? calls.status() : { state: "disabled", playing: false, loop: false, muted: false };
   sendText(
     chatId,
     [
       `Подключение: ${connectionState}`,
-      `VoIP доступно: ${info.available ? "да" : "нет"}`,
-      info.error ? `VoIP ошибка: ${info.error}` : "",
-      `В звонке: ${st.in_call ? "да" : "нет"}`,
-      st.peer ? `Собеседник: ${st.peer}` : "",
+      `Звонок: ${st.state}`,
+      st.jid ? `Собеседник: ${st.jid}` : "",
       `Играет: ${st.playing ? "да" : "нет"}`,
-      st.playing ? `Звук в медиа-мосте: ${st.stream_attached ? "да" : "нет"}` : "",
       `Луп: ${st.loop ? "да" : "нет"}`,
       `Мут: ${st.muted ? "да" : "нет"}`,
     ]
@@ -429,34 +439,29 @@ function handleStatus(chatId) {
 async function handleCall(chatId, parts) {
   const phone = normalizePhone(parts[0]);
   if (!phone) {
-    sendText(chatId, `Используйте ${config.prefix}звони <номер> [файл.mp3]`);
+    sendText(chatId, "Укажите номер телефона");
     return;
   }
-  if (!voipInfo().available) {
-    sendText(chatId, "VoIP недоступна: voice-calls-baileys не загружена");
+  if (!calls) {
+    sendText(chatId, "Сервис звонков не готов");
     return;
   }
   const jid = `${phone}@s.whatsapp.net`;
-  try {
-    sendText(chatId, `Звоним на +${phone}...`);
-    voip.coreSock = sock;
-    await voip.connect();
-    const link = await voip.dial(jid);
-    sendText(chatId, `Звонок инициирован: ${link}`);
-    const name = parts[1];
-    if (name) {
-      const resolved = resolveAudioFile(name);
-      if (!resolved.ok) {
-        sendText(chatId, `Не играю: ${resolved.reason}`);
-        return;
-      }
-      voip.startPlayer(resolved.file);
-      if (voip.status().playing) {
-        sendText(chatId, `Играю в звонок: ${resolved.name}`);
-      } else {
-        sendText(chatId, "Не удалось запустить плеер (проверьте ffmpeg)");
-      }
+  let file = null;
+  if (parts[1]) {
+    const resolved = resolveAudioFile(parts[1]);
+    if (!resolved.ok) {
+      sendText(chatId, `Ошибка: ${resolved.reason}`);
+      return;
     }
+    file = resolved.file;
+  }
+  try {
+    await calls.dial(jid);
+    if (file) {
+      calls.play(file);
+    }
+    sendText(chatId, `Звоним: ${phone}`);
   } catch (e) {
     console.warn("[call] ошибка звонка:", e.message);
     sendText(chatId, `Не удалось позвонить: ${e.message}`);
@@ -464,7 +469,9 @@ async function handleCall(chatId, parts) {
 }
 
 function handleHangup(chatId) {
-  voip.hangup();
+  if (calls) {
+    calls.hangup();
+  }
   sendText(chatId, "Звонок завершён");
 }
 
@@ -551,7 +558,11 @@ function startWebPanel() {
     }
   });
   app.get("/status", (_req, res) => {
-    res.json({ state: connectionState, voip: voipInfo(), qr: Boolean(currentQr) });
+    res.json({
+      state: connectionState,
+      call: calls ? calls.status() : { state: "disabled" },
+      qr: Boolean(currentQr),
+    });
   });
   const port = config.web_port || 3000;
   app.listen(port, () => {
@@ -567,15 +578,62 @@ function scheduleReconnect() {
   }, 3000);
 }
 
+async function startCallSock() {
+  try {
+    if (!fs.existsSync(CALL_AUTH_DIR)) {
+      fs.mkdirSync(CALL_AUTH_DIR, { recursive: true });
+    }
+    const auth = await useCallAuth(CALL_AUTH_DIR);
+    const version = await fetchLatestBaileysVersion().catch((e) => {
+      console.warn("[call] не удалось получить версию WhatsApp:", e.message);
+      return null;
+    });
+    callSock = makeCallSocket({
+      logger,
+      auth: {
+        creds: auth.creds,
+        keys: makeCacheableSignalKeyStore(auth.keys, logger),
+      },
+      version: version?.version,
+      browser: ["Chrome", "Windows", "120.0.0"],
+    });
+    callSock.ev.on("connection.update", (update) => {
+      if (update.qr) {
+        console.log("[call] QR второй сессии звонков:");
+        qrcodeTerminal.generate(update.qr, { small: true });
+      }
+      if (update.connection === "open") {
+        console.log("[call] сессия звонков открыта");
+      }
+      if (update.connection === "close") {
+        const code = update.lastDisconnect?.error?.output?.statusCode;
+        if (code !== DisconnectReason.loggedOut) {
+          console.warn("[call] сессия звонков закрылась, переподключение. Код:", code);
+          setTimeout(startCallSock, 3000);
+        }
+      }
+    });
+    callSock.ev.on("call", (events) => {
+      for (const ev of events) {
+        const note = calls.handleEvent(ev);
+        if (note) {
+          console.log(`[call] ${ev.from}: ${ev.status} (${note})`);
+        }
+      }
+    });
+    calls = new CallManager(callSock, config.voip || {});
+  } catch (e) {
+    console.warn("[call] не удалось запустить сессию звонков:", e.message);
+  }
+}
+
 async function startSock() {
   ensureDirs();
   config = loadConfig();
-  voip = new VoipSession(config.voip || {});
-  const { state, credsSave } = await useMultiFileAuthState(AUTH_DIR);
+  const { state } = await useMultiFileAuthState(AUTH_DIR);
   sock = makeWASocket({
+    logger,
     auth: state,
-    printQRInTerminal: true,
-    credUpdateNotification: credsSave,
   });
 
   sock.ev.on("connection.update", (update) => {
@@ -583,6 +641,8 @@ async function startSock() {
     if (qr) {
       currentQr = qr;
       connectionState = "qr";
+      console.log("[wa] QR основной сессии:");
+      qrcodeTerminal.generate(qr, { small: true });
     }
     if (connection === "open") {
       currentQr = "";
@@ -617,8 +677,8 @@ async function startSock() {
     }
   });
 
-  sock.ev.on("call", async (calls) => {
-    for (const call of calls) {
+  sock.ev.on("call", async (events) => {
+    for (const call of events) {
       if (call.status !== "offer") continue;
       console.log(`[call] входящий звонок из ${call.from}`);
       if (config.voip?.auto_reject_incoming) {
@@ -637,3 +697,4 @@ startWebPanel();
 startSock().catch((e) => {
   console.error("[bot] ошибка запуска:", e.message);
 });
+startCallSock();
