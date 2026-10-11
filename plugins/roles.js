@@ -7,7 +7,10 @@ async function onGroupParticipantsUpdate(sock, update, ctx) {
         const action = mapParticipantAction(update);
         if (!action) return false;
         const env = resolveCtx(ctx, update && (update.author || update.sender));
-        if (!env.db) return false;
+        if (!env.db) {
+            console.error("[roles] база недоступна, событие пропущено");
+            return false;
+        }
         return await reportViolation(sock, action, env);
     } catch (e) {
         console.error("[roles] событие группы:", e.message);
@@ -37,12 +40,17 @@ const plugin = {
         } else if (Array.isArray(payload)) {
             args = payload;
         }
-        const db = getDb(ctx) || getDb(msg);
+        const db = getDb(ctx) || getDb(msg) || getDb(payload) || getDb(globalThis.__pluginCtx);
         const chat = ctx.chat || msg.key.remoteJid;
         const sender = ctx.sender || ctx.author || msg.participant || msg.key.remoteJid;
         const env = { sock, msg, ctx, chat, sender, db };
-        if (!requireDb(env)) {
-            await sock.sendMessage(chat, { text: "⚠️ База данных недоступна, плагин не может работать" }, { quoted: msg });
+        try {
+            if (!requireDb(env)) {
+                await sock.sendMessage(chat, { text: "⚠️ База данных недоступна, плагин не может работать" }, { quoted: msg });
+                return true;
+            }
+        } catch (e) {
+            console.error("[roles] контекст команды:", e.message);
             return true;
         }
         const sub = (args[0] || "").toLowerCase();
@@ -91,13 +99,20 @@ function getDb(ctx) {
         ctx && ctx.services && ctx.services.db,
         ctx && ctx.database,
         ctx && typeof ctx.getDb === "function" ? ctx.getDb() : null,
+        ctx && ctx.services && typeof ctx.services.get === "function" ? ctx.services.get("db") : null,
+        ctx && ctx.services && typeof ctx.services.getDb === "function" ? ctx.services.getDb() : null,
+        ctx && typeof ctx.getService === "function" ? ctx.getService("db") : null,
         globalThis.__pluginDb || null,
     ];
     for (const c of candidates) {
         if (!c) continue;
-        if (typeof c.collection === "function") return c;
-        if (c.db && typeof c.db.collection === "function") return c.db;
-        if (typeof c.collection === "object" && typeof c.collection.find === "function") return c;
+        try {
+            if (typeof c.collection === "function") return c;
+            if (c.db && typeof c.db.collection === "function") return c.db;
+            if (c.client && typeof c.client.db === "function") return c.client.db();
+        } catch (e) {
+            console.error("[roles] поиск базы:", e.message);
+        }
     }
     return null;
 }
