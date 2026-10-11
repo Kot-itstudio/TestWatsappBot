@@ -1,6 +1,5 @@
 let collection = null;
 
-// deny имеет наивысший приоритет: запрет любой роли нельзя перекрыть разрешением другой роли
 const LEVELS = ["allow", "inherit", "deny"];
 
 async function onGroupParticipantsUpdate(sock, update, ctx) {
